@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getCall } from '../../../lib/callStore'
 
 export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /** Client poll target. Returns the current state of a placed call. */
 export async function GET(req: NextRequest) {

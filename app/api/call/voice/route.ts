@@ -3,6 +3,7 @@ import { getTwilioConfig } from '../../../lib/twilio'
 import { createCall } from '../../../lib/callStore'
 
 export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /**
  * TwiML App Voice URL. Twilio hits this when the browser SDK places a call. It

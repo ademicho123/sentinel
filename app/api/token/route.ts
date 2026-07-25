@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { getTwilioConfig, createVoiceToken } from '../../lib/twilio'
 
 export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 /**
  * Issues a Twilio Voice access token for the browser SDK. Returns 501 when
