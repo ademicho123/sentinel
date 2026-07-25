@@ -2,15 +2,18 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  PARENT, CAREGIVER, Conversation, HealthSignal,
+  PARENT, CAREGIVER, Conversation, HealthSignal, TranscriptLine,
   seedHistory, simulateTodaysCall, analyzeCall, chatAsk, SUGGESTED_QUESTIONS,
-  toMealRoasterRequest, mealRoasterRecommendations,
+  toMealRoasterRequest, mealRoasterRecommendations, fetchCallStatus,
 } from './lib/sentinel'
+import { VoiceCallController } from './lib/voiceCall'
+import { Parent, loadParents, saveParents, newParentId, normalisePhone, isValidPhone } from './lib/parents'
 
 const menu = ['Overview', 'Conversations', 'AI Chat', 'Nutrition', 'Medications', 'Trends']
 const menuIcon = ['O', 'C', 'AI', 'N', 'M', 'T']
 
-type CallState = 'ready' | 'live' | 'processing'
+type CallState = 'ready' | 'connecting' | 'live' | 'processing'
+type CallMode = 'sim' | 'twilio'
 
 export default function Home() {
   const [tab, setTab] = useState('Overview')
@@ -21,42 +24,119 @@ export default function Home() {
   const [pending, setPending] = useState<Conversation | null>(null)
   const [justCompleted, setJustCompleted] = useState(false)
   const [analysisSource, setAnalysisSource] = useState<'openai' | 'fallback'>('fallback')
+  const [callMode, setCallMode] = useState<CallMode>('sim')
+  const [callSid, setCallSid] = useState<string | null>(null)
+  const [callError, setCallError] = useState<string | null>(null)
+  const [parents, setParents] = useState<Parent[]>([])
+  const [selectedParentId, setSelectedParentId] = useState<string>('')
+  // Real (Twilio) transcript once the recording is transcribed; null for the
+  // simulated flow. Held in a ref so the processing effect always reads latest.
+  const realRef = useRef<{ transcript: TranscriptLine[]; durationMin: number } | null>(null)
+  const ctrlRef = useRef<VoiceCallController | null>(null)
 
   const latest = conversations[0]
 
+  // Parent contacts are managed in Settings and stored locally.
+  useEffect(() => {
+    const p = loadParents()
+    setParents(p)
+    setSelectedParentId(p[0]?.id ?? '')
+  }, [])
+
+  const updateParents = (next: Parent[]) => {
+    setParents(next)
+    saveParents(next)
+    if (!next.find(p => p.id === selectedParentId)) setSelectedParentId(next[0]?.id ?? '')
+  }
+  const selectedParent = parents.find(p => p.id === selectedParentId) ?? parents[0]
+
+  // Live timer.
   useEffect(() => {
     if (callState !== 'live') return
     const timer = window.setInterval(() => setSeconds(n => n + 1), 1000)
     return () => window.clearInterval(timer)
   }, [callState])
 
-  // When the call ends, send the transcript to the OpenAI-backed /api/analyze
-  // (falling back to local logic), persist the result as a structured record,
-  // then refresh the dashboard and take the caregiver straight to it.
+  // Processing: a real call polls for its recording's transcription, then
+  // analyses; a simulated call analyses immediately. Both persist the record and
+  // open the refreshed dashboard.
   useEffect(() => {
     if (callState !== 'processing') return
     let cancelled = false
+    let timer = 0
     const started = Date.now()
-    analyzeCall(conversations).then(({ conversation, source }) => {
-      const wait = Math.max(0, 2600 - (Date.now() - started)) // let the steps animate
-      window.setTimeout(() => {
+
+    const finish = (real: { transcript: TranscriptLine[]; durationMin: number } | null) => {
+      analyzeCall(conversations, real ?? undefined).then(({ conversation, source }) => {
+        const wait = Math.max(0, 2600 - (Date.now() - started)) // let the steps animate
+        timer = window.setTimeout(() => {
+          if (cancelled) return
+          setConversations(prev => [conversation, ...prev])
+          setAnalysisSource(source)
+          setCallOpen(false)
+          setJustCompleted(true)
+          setTab('Overview')
+        }, wait)
+      })
+    }
+
+    if (callMode === 'twilio' && callSid) {
+      const startedPoll = Date.now()
+      const tick = async () => {
         if (cancelled) return
-        setConversations(prev => [conversation, ...prev])
-        setAnalysisSource(source)
-        setCallOpen(false)
-        setJustCompleted(true)
-        setTab('Overview')
-      }, wait)
-    })
-    return () => { cancelled = true }
+        const s = await fetchCallStatus(callSid)
+        if (cancelled) return
+        if (s.status === 'ready') { finish({ transcript: s.transcript ?? [], durationMin: s.durationMin ?? Math.max(1, Math.round(seconds / 60)) }); return }
+        if (s.status === 'error' || Date.now() - startedPoll > 3 * 60 * 1000) { setCallError(s.error ?? 'Could not retrieve the recording.'); finish(null); return }
+        timer = window.setTimeout(tick, 3000)
+      }
+      tick()
+    } else {
+      finish(realRef.current)
+    }
+    return () => { cancelled = true; window.clearTimeout(timer) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [callState])
 
   const openCall = () => {
     setPending(simulateTodaysCall(conversations))
     setSeconds(0)
+    setCallMode('sim')
+    setCallSid(null)
+    setCallError(null)
+    realRef.current = null
     setCallState('ready')
     setCallOpen(true)
+  }
+
+  // Place a real call through the browser Voice SDK; fall back to the simulated
+  // flow when Twilio isn't configured or no number is set for this parent.
+  const beginCall = async () => {
+    setCallError(null)
+    setSeconds(0)
+    setCallSid(null)
+    realRef.current = null
+    const phone = selectedParent?.phone?.trim()
+    if (!phone) { setCallMode('sim'); setCallState('live'); return }
+
+    setCallState('connecting')
+    const ctrl = new VoiceCallController()
+    ctrlRef.current = ctrl
+    const mode = await ctrl.start(phone, {
+      onConnected: sid => setCallSid(sid || null),
+      onEnded: () => setCallState('processing'),
+      onError: msg => { setCallError(msg); setCallState('processing') },
+    })
+    setCallMode(mode)
+    setSeconds(0)
+    setCallState('live')
+  }
+
+  // End button: hang up a real call (its onEnded moves to processing); a
+  // simulated call goes straight to processing.
+  const endCall = () => {
+    if (callMode === 'twilio') ctrlRef.current?.hangup()
+    else setCallState('processing')
   }
 
   return <main className="shell">
@@ -65,20 +145,20 @@ export default function Home() {
       <div className="family-label">YOUR FAMILY</div>
       <button className="person-card" onClick={() => setTab('Overview')}><div className="avatar el">{PARENT.initial}</div><div><b>{PARENT.name}</b><small>{justCompleted ? 'Call summary ready' : 'Ready for a family call'}</small></div><span className="dot" /></button>
       <nav className="nav">{menu.map((name, i) => <button key={name} onClick={() => setTab(name)} className={tab === name ? 'active' : ''}><span>{menuIcon[i]}</span>{name}</button>)}</nav>
-      <div className="sidebar-bottom"><button onClick={() => setTab('Help')}><span>?</span> Help &amp; support</button><button onClick={() => setTab('Settings')}><span>*</span> Settings</button><div className="profile"><div className="avatar me">{CAREGIVER.initial}</div><div><b>{CAREGIVER.name}</b><small>Caregiver</small></div></div></div>
+      <div className="sidebar-bottom"><button onClick={() => setTab('Help')}><span>?</span> Help &amp; support</button><button onClick={() => setTab('Settings')}><span>*</span> Settings</button><div className="profile"><div className="avatar me">{CAREGIVER.initial}</div><div><b>{CAREGIVER.label}</b><small>Family check-ins</small></div></div></div>
     </aside>
     <section className="content">
-      <header><div><p className="eyebrow">AI-ASSISTED FAMILY CALLS</p><h1>{tab === 'Overview' ? `Good morning, ${CAREGIVER.name.split(' ')[0]}` : tab}</h1><p className="sub">{tab === 'Overview' ? `A calmer view of ${PARENT.shortName}’s wellbeing.` : `${PARENT.shortName}’s information, presented with care.`}</p></div><div className="header-actions"><button className="bell" aria-label="Notifications">o<i /></button><button className="checkin" onClick={openCall}><span>📞</span> Call Parent</button></div></header>
+      <header><div><p className="eyebrow">AI-ASSISTED FAMILY CALLS</p><h1>{tab === 'Overview' ? 'Good morning' : tab}</h1><p className="sub">{tab === 'Overview' ? `A calmer view of ${PARENT.shortName}’s wellbeing.` : `${PARENT.shortName}’s information, presented with care.`}</p></div><div className="header-actions"><button className="bell" aria-label="Notifications">o<i /></button><button className="checkin" onClick={openCall}><span>📞</span> Call Parent</button></div></header>
       {tab === 'Overview' && <Overview latest={latest} conversations={conversations} openCall={openCall} completed={justCompleted} source={analysisSource} setTab={setTab} />}
       {tab === 'Conversations' && <ConversationsView conversations={conversations} openCall={openCall} />}
       {tab === 'AI Chat' && <AIChat conversations={conversations} />}
       {tab === 'Nutrition' && <NutritionView latest={latest} />}
       {tab === 'Medications' && <MedicationsView conversations={conversations} />}
       {tab === 'Trends' && <TrendsView conversations={conversations} />}
-      {!menu.includes(tab) && <SettingsView tab={tab} />}
-      <footer>Sentinel is for wellbeing awareness only. It listens to assist your family calls and never provides medical advice or diagnoses. <a>Learn more</a></footer>
+      {!menu.includes(tab) && <SettingsView tab={tab} parents={parents} onChange={updateParents} />}
+      <footer>Sentinel is for wellbeing awareness only. You make the call; Sentinel listens to help, never calls on its own, and never provides medical advice or diagnoses. <a>Learn more</a></footer>
     </section>
-    {callOpen && pending && <FamilyCall state={callState} seconds={seconds} pending={pending} onBegin={() => setCallState('live')} onEnd={() => setCallState('processing')} onClose={() => setCallOpen(false)} />}
+    {callOpen && pending && <FamilyCall state={callState} mode={callMode} seconds={seconds} pending={pending} error={callError} parents={parents} selectedParentId={selectedParentId} selectedParent={selectedParent} onSelectParent={setSelectedParentId} onBegin={beginCall} onEnd={endCall} onClose={() => setCallOpen(false)} />}
   </main>
 }
 
@@ -89,11 +169,11 @@ function Overview({ latest, conversations, openCall, completed, source, setTab }
   return <>
     {completed
       ? <section className="completed-banner"><span>✓</span><div><b>Call summary added to {PARENT.shortName}’s dashboard</b><p>Your family call was analysed privately and the latest wellbeing signals are ready to review below.</p></div><span className={`analysis-tag ${source}`}>{source === 'openai' ? 'Analysed by OpenAI' : 'Offline analysis'}</span></section>
-      : <section className="call-hero"><div><p className="eyebrow">STAY CONNECTED, WITH A LITTLE MORE CLARITY</p><h2>Call {PARENT.shortName}. Sentinel listens quietly in the background.</h2><p>Have the conversation you would normally have. {PARENT.shortName} answers on her normal phone — no app to install. Sentinel turns it into a gentle wellbeing summary afterwards.</p><button className="hero-call" onClick={openCall}>📞 Call {PARENT.shortName} <span>-&gt;</span></button></div><div className="hero-orb"><span>AI</span><i /><i /><i /></div></section>}
+      : <section className="call-hero"><div><p className="eyebrow">STAY CONNECTED, WITH A LITTLE MORE CLARITY</p><h2>You make the call. Sentinel gives you gentle feedback afterwards.</h2><p>Sentinel never calls on its own, and it never replaces hearing a loved one’s voice — that connection is part of care. You start the call from the app and talk as you always would; afterwards Sentinel turns it into a clear summary and wellbeing signals, here.</p><button className="hero-call" onClick={openCall}>📞 Call Parent <span>-&gt;</span></button></div><div className="hero-orb"><span>AI</span><i /><i /><i /></div></section>}
 
     <section className="quick-actions"><button onClick={() => setTab('Overview')}>View dashboard</button><button onClick={() => setTab('Conversations')}>Recent conversations</button><button onClick={() => setTab('Trends')}>Trends</button><button onClick={() => setTab('AI Chat')}>AI Chat</button></section>
 
-    <section className="summary-card"><div className="panel-title"><div><p className="eyebrow">CAREGIVER SUMMARY</p><h2>Today, in a few words</h2></div><span className={`risk-pill ${latest.riskLevel.toLowerCase()}`}>{latest.riskLevel}</span></div><p className="summary-text">{latest.summary}</p></section>
+    <section className="summary-card"><div className="panel-title"><div><p className="eyebrow">YOUR CALL SUMMARY</p><h2>Today, in a few words</h2></div><span className={`risk-pill ${latest.riskLevel.toLowerCase()}`}>{latest.riskLevel}</span></div><p className="summary-text">{latest.summary}</p></section>
 
     <section className="today-head"><div><p className="eyebrow">LATEST FAMILY CALL</p><h2>{completed ? 'Today’s call is ready to review' : 'A steady, connected day'}</h2></div><div className="complete"><span>✓</span> {latest.label} · {latest.durationMin} min</div></section>
 
@@ -106,7 +186,7 @@ function Overview({ latest, conversations, openCall, completed, source, setTab }
 
     <section className="grid-main">
       <article className="panel signals"><div className="panel-title"><div><p className="eyebrow">AI HEALTH SIGNALS</p><h2>What we’re noticing</h2></div><span className="wellbeing-score">Wellbeing {latest.wellbeingScore}</span></div>{latest.signals.length ? latest.signals.map((s, i) => <SignalCard key={i} signal={s} />) : <p className="empty-note">No notable changes from {PARENT.shortName}’s baseline on this call.</p>}</article>
-      <article className="panel conversation"><div className="panel-title"><div><p className="eyebrow">RECENT FAMILY CALL</p><h2>A lovely conversation</h2></div><button onClick={openCall}>Call {PARENT.shortName} -&gt;</button></div><div className="conversation-body"><div className="orb"><div className="sound"><i /><i /><i /><i /><i /></div></div><div><h3>{latest.durationMin} min conversation</h3><p>Sentinel listened silently in the background and turned your chat into the signals on the left.</p><div className="tags">{conversationTags(latest).map(t => <span key={t}>{t}</span>)}</div></div></div><div className="quote">“{latest.transcript.find(l => l.speaker === PARENT.name.split(' ')[0])?.text || latest.transcript[1]?.text}”</div></article>
+      <article className="panel conversation"><div className="panel-title"><div><p className="eyebrow">RECENT FAMILY CALL</p><h2>A lovely conversation</h2></div><button onClick={openCall}>Call Parent -&gt;</button></div><div className="conversation-body"><div className="orb"><div className="sound"><i /><i /><i /><i /><i /></div></div><div><h3>{latest.durationMin} min conversation</h3><p>Sentinel listened silently in the background and turned your chat into the signals on the left.</p><div className="tags">{conversationTags(latest).map(t => <span key={t}>{t}</span>)}</div></div></div><div className="quote">“{latest.transcript.find(l => l.speaker === PARENT.name.split(' ')[0])?.text || latest.transcript[1]?.text}”</div></article>
     </section>
 
     <TrendPanel conversations={conversations} />
@@ -193,7 +273,7 @@ function ConversationsView({ conversations, openCall }: { conversations: Convers
   const [selected, setSelected] = useState(conversations[0]?.id)
   const active = conversations.find(c => c.id === selected) || conversations[0]
   return <section className="section-view convo-view">
-    <article className="panel view-lead"><p className="eyebrow">{PARENT.name.toUpperCase()}’S CALL HISTORY</p><h2>Recent conversations</h2><p>Every completed call is stored privately with its transcript, extractions and AI signals. Select one to read it back.</p><button className="checkin" onClick={openCall}>📞 Call {PARENT.shortName}</button></article>
+    <article className="panel view-lead"><p className="eyebrow">{PARENT.name.toUpperCase()}’S CALL HISTORY</p><h2>Recent conversations</h2><p>Every completed call is stored privately with its transcript, extractions and AI signals. Select one to read it back.</p><button className="checkin" onClick={openCall}>📞 Call Parent</button></article>
     <div className="convo-grid">
       <article className="panel convo-list">{conversations.map(c => <button key={c.id} onClick={() => setSelected(c.id)} className={`convo-row ${c.id === selected ? 'sel' : ''}`}><div><b>{c.label}</b><small>{c.durationMin} min · wellbeing {c.wellbeingScore}</small></div><span className={`risk-dot ${c.riskLevel.toLowerCase()}`} /></button>)}</article>
       {active && <article className="panel convo-detail"><div className="panel-title"><div><p className="eyebrow">TRANSCRIPT · {active.label.toUpperCase()}</p><h2>{active.durationMin} minute conversation</h2></div><span className={`risk-pill ${active.riskLevel.toLowerCase()}`}>{active.riskLevel}</span></div>
@@ -209,7 +289,7 @@ function ConversationsView({ conversations, openCall }: { conversations: Convers
 
 function AIChat({ conversations }: { conversations: Conversation[] }) {
   const [messages, setMessages] = useState<{ role: 'user' | 'ai'; text: string }[]>([
-    { role: 'ai', text: `Hi ${CAREGIVER.name.split(' ')[0]}. I can answer questions from your ${conversations.length} recorded calls with ${PARENT.shortName} — her eating, hydration, medication, speech and how things are trending. What would you like to know?` },
+    { role: 'ai', text: `Hi. I can answer questions from your ${conversations.length} recorded calls with ${PARENT.shortName} — her eating, hydration, medication, speech and how things are trending. What would you like to know?` },
   ])
   const [input, setInput] = useState('')
   const [thinking, setThinking] = useState(false)
@@ -301,18 +381,64 @@ function TrendsView({ conversations }: { conversations: Conversation[] }) {
 
 // --------------------------------------------------------------------------
 
-function SettingsView({ tab }: { tab: string }) {
-  const items = tab === 'Help' ? ['How Sentinel listens during calls', 'Privacy & data storage', 'Contact support'] : ['Notifications', 'Family access', 'Telephony (Twilio) connection', 'Export conversation data']
-  return <section className="section-view"><article className="panel view-lead"><p className="eyebrow">{PARENT.name.toUpperCase()}’S CARE SPACE</p><h2>{tab}</h2><p>Manage your Sentinel experience.</p></article><article className="panel view-list">{items.map((line, i) => <button className="view-item" key={line}><span className={`view-number n${(i % 3) + 1}`}>{i + 1}</span><span>{line}</span><b>&gt;</b></button>)}</article></section>
+function SettingsView({ tab, parents, onChange }: { tab: string; parents: Parent[]; onChange: (next: Parent[]) => void }) {
+  if (tab === 'Settings') return <section className="section-view"><ParentsSettings parents={parents} onChange={onChange} /></section>
+  const items = ['How Sentinel listens during calls', 'Privacy & data storage', 'Contact support']
+  return <section className="section-view"><article className="panel view-lead"><p className="eyebrow">SENTINEL</p><h2>{tab}</h2><p>Manage your Sentinel experience.</p></article><article className="panel view-list">{items.map((line, i) => <button className="view-item" key={line}><span className={`view-number n${(i % 3) + 1}`}>{i + 1}</span><span>{line}</span><b>&gt;</b></button>)}</article></section>
+}
+
+function ParentsSettings({ parents, onChange }: { parents: Parent[]; onChange: (next: Parent[]) => void }) {
+  const [name, setName] = useState('')
+  const [phone, setPhone] = useState('')
+  const [error, setError] = useState('')
+
+  const add = () => {
+    const trimmed = name.trim()
+    const p = normalisePhone(phone)
+    if (!trimmed) { setError('Add a name.'); return }
+    if (!isValidPhone(p)) { setError('Enter a phone number in international format, e.g. +447700900123.'); return }
+    onChange([...parents, { id: newParentId(), name: trimmed, phone: p }])
+    setName(''); setPhone(''); setError('')
+  }
+  const remove = (id: string) => onChange(parents.filter(p => p.id !== id))
+  const setPhoneFor = (id: string, value: string) => onChange(parents.map(p => p.id === id ? { ...p, phone: normalisePhone(value) } : p))
+
+  return <>
+    <article className="panel view-lead">
+      <p className="eyebrow">SETTINGS</p><h2>Parents &amp; phone numbers</h2>
+      <p>Add the people you check on and the phone number Sentinel should call. You can add more than one. Numbers are stored on this device and used to place the call — you talk through the app, so you don’t need a phone.</p>
+    </article>
+    <article className="panel">
+      <div className="panel-title"><div><p className="eyebrow">YOUR PARENTS</p><h2>{parents.length} saved</h2></div></div>
+      <div className="parent-list">
+        {parents.map(p => <div className="parent-row" key={p.id}>
+          <div className="parent-avatar">{(p.name[0] || '?').toUpperCase()}</div>
+          <div className="parent-meta"><b>{p.name}</b><input className="parent-phone-input" value={p.phone} placeholder="+44 7700 900123" onChange={e => setPhoneFor(p.id, e.target.value)} aria-label={`Phone number for ${p.name}`} /></div>
+          <div className="parent-tag">{isValidPhone(p.phone) ? <span className="ok">Callable</span> : <span className="warn">No number</span>}</div>
+          <button className="parent-remove" onClick={() => remove(p.id)} disabled={parents.length <= 1} aria-label={`Remove ${p.name}`}>Remove</button>
+        </div>)}
+      </div>
+    </article>
+    <article className="panel">
+      <div className="panel-title"><div><p className="eyebrow">ADD A PARENT</p><h2>New contact</h2></div></div>
+      <div className="parent-add">
+        <input value={name} onChange={e => setName(e.target.value)} placeholder="Name (e.g. Dad)" aria-label="Parent name" />
+        <input value={phone} onChange={e => setPhone(e.target.value)} placeholder="Phone, e.g. +447700900123" aria-label="Parent phone number" />
+        <button onClick={add}>Add parent</button>
+      </div>
+      {error && <p className="parent-error">{error}</p>}
+      <small className="chat-note">International format (starts with +). Numbers never leave this device except to place the call.</small>
+    </article>
+  </>
 }
 
 // --------------------------------------------------------------------------
 
 const PROCESS_STEPS = ['Transcript completed', 'Nutrition extracted', 'Medication analysed', 'Vocal biomarkers generated', 'Health signals detected', 'Caregiver summary created']
 
-function FamilyCall({ state, seconds, pending, onBegin, onEnd, onClose }: { state: CallState; seconds: number; pending: Conversation; onBegin: () => void; onEnd: () => void; onClose: () => void }) {
+function FamilyCall({ state, mode, seconds, pending, error, parents, selectedParentId, selectedParent, onSelectParent, onBegin, onEnd, onClose }: { state: CallState; mode: CallMode; seconds: number; pending: Conversation; error: string | null; parents: Parent[]; selectedParentId: string; selectedParent: Parent | undefined; onSelectParent: (id: string) => void; onBegin: () => void; onEnd: () => void; onClose: () => void }) {
   const time = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
-  // Reveal the transcript progressively as the "call" unfolds.
+  // Simulated mode: reveal the transcript progressively as the "call" unfolds.
   const shown = Math.min(pending.transcript.length, Math.floor(seconds / 2) + 1)
   const [step, setStep] = useState(0)
   useEffect(() => {
@@ -321,27 +447,57 @@ function FamilyCall({ state, seconds, pending, onBegin, onEnd, onClose }: { stat
     return () => window.clearInterval(t)
   }, [state])
 
+  const parentName = selectedParent?.name ?? PARENT.name
+  const parentPhone = selectedParent?.phone?.trim()
+  const hasNumber = !!parentPhone
+
+  const eyebrow = state === 'connecting' ? 'PLACING YOUR CALL'
+    : state === 'live' ? 'FAMILY CALL IN PROGRESS'
+    : state === 'processing' ? 'ANALYSING CONVERSATION' : 'AI-ASSISTED FAMILY CALL'
+  const heading = state === 'ready' ? `Call ${parentName}`
+    : state === 'connecting' ? 'Connecting…'
+    : state === 'live' ? parentName : 'Analysing your conversation'
+
   return <div className="call-backdrop" role="dialog" aria-modal="true"><section className="call-modal family-call">
     {state !== 'processing' && <button className="modal-close" onClick={onClose} aria-label="Close">x</button>}
-    <div className="call-avatar">{PARENT.initial}</div>
-    <p className="eyebrow">{state === 'live' ? 'FAMILY CALL IN PROGRESS' : state === 'processing' ? 'ANALYSING CONVERSATION' : 'AI-ASSISTED FAMILY CALL'}</p>
-    <h2>{state === 'ready' ? `Call ${PARENT.name}` : state === 'live' ? PARENT.name : 'Analysing your conversation'}</h2>
+    <div className="call-avatar">{(parentName[0] || 'P').toUpperCase()}</div>
+    <p className="eyebrow">{eyebrow}</p>
+    <h2>{heading}</h2>
 
-    {state === 'ready' && <><p className="phone-number">{PARENT.phone}</p><p className="call-copy">{PARENT.shortName} answers on her normal phone — nothing to install. Sentinel joins quietly to transcribe and spot gentle wellbeing signals after you talk.</p></>}
+    {state === 'ready' && <>
+      {parents.length > 1 && <select className="parent-select" value={selectedParentId} onChange={e => onSelectParent(e.target.value)} aria-label="Choose who to call">{parents.map(p => <option key={p.id} value={p.id}>{p.name}{p.phone ? ` · ${p.phone}` : ' · no number'}</option>)}</select>}
+      <p className="phone-number">{hasNumber ? parentPhone : 'No number set'}</p>
+      <p className="call-copy">You start the call and talk through the app; {parentName} answers on their normal phone — nothing to install. Sentinel just listens in and turns the conversation into gentle wellbeing signals after you hang up. It never calls on its own.</p>
+      {!hasNumber && <p className="call-hint">No phone number for {parentName} yet — this will run a simulated call. Add a number in Settings to place a real one.</p>}
+    </>}
 
-    {state === 'live' && <>
-      <p className="phone-number">{PARENT.phone}</p>
+    {state === 'connecting' && <><p className="phone-number">{parentPhone}</p><div className="call-spinner" aria-hidden="true"><i /></div><p className="call-copy">Connecting to {parentName}. Allow microphone access if your browser asks.</p></>}
+
+    {/* Simulated live call: no telephony configured / no number. */}
+    {state === 'live' && mode === 'sim' && <>
+      <p className="phone-number">{hasNumber ? parentPhone : 'Simulated call'}</p>
       <div className="call-timer">LIVE {time} <span>AI LISTENING</span></div>
       <div className="call-transcript">{pending.transcript.slice(0, shown).map((l, i) => <p key={i}><b>{l.speaker}</b> {l.text}</p>)}{shown < pending.transcript.length && <p className="typing"><i /><i /><i /></p>}</div>
       <div className="listening-status"><span>✓ Nutrition</span><span>✓ Medication</span><span>✓ Vocal biomarkers</span><span>✓ Hydration</span></div>
     </>}
 
-    {state === 'processing' && <div className="processing-list">{PROCESS_STEPS.map((label, i) => <p key={label} className={i < step ? 'done' : ''}>{label} <b>{i < step ? '✓' : '…'}</b></p>)}</div>}
+    {/* Real Twilio call in progress: you talk in the browser, we record. */}
+    {state === 'live' && mode === 'twilio' && <>
+      <p className="phone-number">{parentPhone}</p>
+      <div className="call-timer">ON CALL {time} <span>RECORDING</span></div>
+      <div className="call-live-note"><div className="call-spinner"><i /></div><p>You’re connected to {parentName} and the call is recording. Talk naturally — when you press End, Sentinel transcribes the recording with OpenAI and updates the dashboard.</p></div>
+      <div className="listening-status"><span>✓ Nutrition</span><span>✓ Medication</span><span>✓ Vocal biomarkers</span><span>✓ Hydration</span></div>
+    </>}
+
+    {state === 'processing' && <>
+      {error && <p className="call-error">{error} Showing the best analysis Sentinel could produce.</p>}
+      <div className="processing-list">{PROCESS_STEPS.map((label, i) => <p key={label} className={i < step ? 'done' : ''}>{label} <b>{i < step ? '✓' : '…'}</b></p>)}</div>
+    </>}
 
     <div className="call-actions">
-      {state === 'ready' && <button className="begin-call" onClick={onBegin}>📞 Call {PARENT.shortName}</button>}
+      {state === 'ready' && <button className="begin-call" onClick={onBegin}>📞 Call {parentName.split(' ')[0]}</button>}
       {state === 'live' && <button className="end-call" onClick={onEnd}>End call</button>}
     </div>
-    {state !== 'processing' && <small className="call-note">Demo call interface. A live call connects through a telephony provider such as Twilio, with Sentinel joining as a silent AI listener.</small>}
+    {(state === 'ready' || state === 'connecting') && <small className="call-note">You place the call from the app and speak through it — Sentinel never calls on its own. With Twilio configured this is a real call; without it, a simulated call lets you explore the flow.</small>}
   </section></div>
 }

@@ -4,7 +4,7 @@ import { BASELINE, type CallExtraction, type TranscriptLine } from '../../lib/se
 
 export const runtime = 'nodejs'
 
-const SYSTEM = `You are Sentinel, an AI that quietly listens to a family phone call between an adult child (the caregiver) and their older parent, then extracts wellbeing signals from the transcript. You observe and analyse — you never diagnose disease or give medical advice. Return ONLY a JSON object matching the requested schema. Base every value strictly on what is said in the transcript; if something is not mentioned, use empty arrays or neutral defaults (do not invent).`
+const SYSTEM = `You are Sentinel, an AI that quietly listens to a family phone call that a family member has started with their older parent, then extracts wellbeing signals from the transcript. Sentinel never places calls on its own and never replaces the conversation. You observe and analyse — you never diagnose disease or give medical advice. Return ONLY a JSON object matching the requested schema. Base every value strictly on what is said in the transcript; if something is not mentioned, use empty arrays or neutral defaults (do not invent).`
 
 const SCHEMA = `Return JSON with exactly this shape:
 {

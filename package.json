@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@twilio/voice-sdk": "^2.18.3",
     "@types/node": "22.10.2",
     "@types/react": "19.0.2",
     "@types/react-dom": "19.0.2",
@@ -16,7 +17,8 @@
     "openai": "^6.49.0",
     "react": "19.0.0",
     "react-dom": "19.0.0",
-    "recharts": "2.15.0"
+    "recharts": "2.15.0",
+    "twilio": "^6.0.2"
   },
   "devDependencies": {
     "autoprefixer": "10.4.20",

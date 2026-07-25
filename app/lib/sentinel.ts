@@ -1,10 +1,11 @@
 // Sentinel — AI-assisted family call domain model & analysis.
 //
-// Sentinel never replaces the conversation between loved ones. The caregiver
-// calls their parent on a normal phone (connected via a telephony provider such
-// as Twilio); Sentinel joins silently as an AI *listener*, transcribes, and
-// turns the conversation the family was already having into gentle wellbeing
-// signals. It observes and analyses — it never diagnoses.
+// Sentinel never calls on its own and never replaces hearing a loved one's
+// voice — that connection is part of care. A family member starts the call
+// themselves (through the app, over a provider such as Twilio); Sentinel just
+// listens in, transcribes, and turns the conversation the family was already
+// having into gentle wellbeing feedback. It observes and analyses — it never
+// diagnoses.
 //
 // Every completed call is stored as a structured `Conversation` (see below),
 // which is what the dashboard, trends and AI chat all read from. The shape is
@@ -82,12 +83,14 @@ export interface Conversation {
 
 export const PARENT = {
   name: 'Eleanor Wilson',
-  shortName: 'Mum',
+  shortName: 'Eleanor',
   initial: 'E',
   phone: '+44 7700 900 412',
 }
 
-export const CAREGIVER = { name: 'Anna Wilson', initial: 'A' }
+// The person using the app is simply someone checking on their parent — no
+// name, no "caregiver" label. Their voice appears in transcripts as "You".
+export const CAREGIVER = { label: 'You', initial: '·', speaker: 'You' }
 
 /** The parent's personal baseline. Vocal biomarkers on each call are compared
  *  against this rather than against any population norm. */
@@ -110,9 +113,9 @@ export const seedHistory: Conversation[] = [
     label: 'Yesterday, 9:38 am',
     durationMin: 9,
     transcript: [
-      { speaker: 'Anna', text: 'Morning Mum, how did you sleep?' },
+      { speaker: 'You', text: 'Morning, how did you sleep?' },
       { speaker: 'Eleanor', text: 'Not too bad love. I had some toast, but I wasn’t very hungry at teatime.' },
-      { speaker: 'Anna', text: 'Did you manage your morning tablets?' },
+      { speaker: 'You', text: 'Did you manage your morning tablets?' },
       { speaker: 'Eleanor', text: 'Yes, took them with my tea as always.' },
     ],
     nutrition: { meals: ['toast'], snacks: [], drinks: ['tea'], appetite: 'low', hydrationGlasses: 4, proteinNote: 'Low protein day', weightNote: 'Stable', skippedMeals: ['dinner'] },
@@ -130,9 +133,9 @@ export const seedHistory: Conversation[] = [
     label: 'Tuesday, 9:45 am',
     durationMin: 7,
     transcript: [
-      { speaker: 'Anna', text: 'Hiya Mum, what have you been up to?' },
+      { speaker: 'You', text: 'Hiya, what have you been up to?' },
       { speaker: 'Eleanor', text: 'Been out in the garden with the daffodils. Had a nice bowl of soup for lunch.' },
-      { speaker: 'Anna', text: 'Lovely. Drinking plenty?' },
+      { speaker: 'You', text: 'Lovely. Drinking plenty?' },
       { speaker: 'Eleanor', text: 'I’ve had a few glasses of water today, feeling good.' },
     ],
     nutrition: { meals: ['soup'], snacks: ['biscuit'], drinks: ['water', 'tea'], appetite: 'fair', hydrationGlasses: 6, proteinNote: 'Moderate', weightNote: 'Stable', skippedMeals: [] },
@@ -150,9 +153,9 @@ export const seedHistory: Conversation[] = [
     label: 'Sunday, 9:40 am',
     durationMin: 8,
     transcript: [
-      { speaker: 'Anna', text: 'Morning Mum.' },
+      { speaker: 'You', text: 'Morning.' },
       { speaker: 'Eleanor', text: 'Morning. I had porridge and a boiled egg, felt quite peckish today.' },
-      { speaker: 'Anna', text: 'That’s great. Tablets done?' },
+      { speaker: 'You', text: 'That’s great. Tablets done?' },
       { speaker: 'Eleanor', text: 'All done, and I had my water bottle by me all morning.' },
     ],
     nutrition: { meals: ['porridge', 'boiled egg'], snacks: ['fruit'], drinks: ['water', 'tea'], appetite: 'good', hydrationGlasses: 7, proteinNote: 'Good protein (egg)', weightNote: 'Stable', skippedMeals: [] },
@@ -344,13 +347,13 @@ export interface CallExtraction {
 export const DEMO_CALL: { durationMin: number; transcript: TranscriptLine[]; fallbackExtraction: CallExtraction } = {
   durationMin: 11,
   transcript: [
-    { speaker: 'Anna', text: `Morning ${PARENT.shortName}, how are you feeling today?` },
+    { speaker: 'You', text: 'Morning, how are you feeling today?' },
     { speaker: 'Eleanor', text: 'Hello love. I’m alright. I had some cereal for breakfast.' },
-    { speaker: 'Anna', text: 'Lovely. Did you have any lunch?' },
+    { speaker: 'You', text: 'Lovely. Did you have any lunch?' },
     { speaker: 'Eleanor', text: 'I had a bit of soup, but I didn’t really fancy any dinner last night.' },
-    { speaker: 'Anna', text: 'And your morning tablets?' },
+    { speaker: 'You', text: 'And your morning tablets?' },
     { speaker: 'Eleanor', text: 'Yes, took those with my tea first thing.' },
-    { speaker: 'Anna', text: 'Have you been drinking enough water?' },
+    { speaker: 'You', text: 'Have you been drinking enough water?' },
     { speaker: 'Eleanor', text: 'Ooh, maybe not so much today, I’ve been busy.' },
   ],
   fallbackExtraction: {
@@ -388,15 +391,39 @@ export function simulateTodaysCall(history: Conversation[]): Conversation {
 // network never breaks the demo.
 // ---------------------------------------------------------------------------
 
-export async function analyzeCall(history: Conversation[]): Promise<{ conversation: Conversation; source: 'openai' | 'fallback' }> {
-  const { transcript, durationMin, fallbackExtraction } = DEMO_CALL
+export async function analyzeCall(
+  history: Conversation[],
+  opts?: { transcript?: TranscriptLine[]; durationMin?: number },
+): Promise<{ conversation: Conversation; source: 'openai' | 'fallback' }> {
+  const transcript = opts?.transcript?.length ? opts.transcript : DEMO_CALL.transcript
+  const durationMin = opts?.durationMin ?? DEMO_CALL.durationMin
   try {
     const res = await fetch('/api/analyze', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ transcript, durationMin }) })
     if (!res.ok) throw new Error(`analyze ${res.status}`)
     const ex = (await res.json()) as CallExtraction
     return { conversation: finaliseFromExtraction(transcript, durationMin, ex, history), source: 'openai' }
   } catch {
-    return { conversation: finaliseFromExtraction(transcript, durationMin, fallbackExtraction, history), source: 'fallback' }
+    // Last-resort extraction (only accurate for the demo transcript, but keeps
+    // the real transcript on the record).
+    return { conversation: finaliseFromExtraction(transcript, durationMin, DEMO_CALL.fallbackExtraction, history), source: 'fallback' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Real calls run through the browser Twilio Voice SDK (see lib/voiceCall.ts).
+// Once a call ends, its recording is transcribed server-side; the client polls
+// this endpoint for the result.
+// ---------------------------------------------------------------------------
+
+export interface CallStatusResult { status: 'pending' | 'ready' | 'error'; transcript?: TranscriptLine[]; durationMin?: number; error?: string }
+
+export async function fetchCallStatus(callSid: string): Promise<CallStatusResult> {
+  try {
+    const res = await fetch(`/api/call/status?callSid=${encodeURIComponent(callSid)}`)
+    if (!res.ok) return { status: 'error', error: `status ${res.status}` }
+    return (await res.json()) as CallStatusResult
+  } catch {
+    return { status: 'error', error: 'network' }
   }
 }
 
